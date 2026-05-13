@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>IMG Visualizer</title>
+    <!-- math.js to securely evaluate complex expressions -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/11.8.0/math.js"></script>
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+        #toolbar{padding:10px 16px;background:#161b22;border-bottom:1px solid #30363d;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+        label{font-size:12px;color:#8b949e;font-weight:600}
+        input{background:#010409;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:6px;font-family:monospace;font-size:14px}
+        input:focus{outline:none;border-color:#58a6ff}
+        button{background:#238636;border:1px solid rgba(240,246,252,0.1);color:#fff;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
+        button:hover{background:#2ea043}
+        #workspaces{display:flex;flex:1;min-height:0}
+        .pane{flex:1;position:relative;overflow:hidden}
+        .pane:first-child{border-right:1px solid #30363d}
+        
+        /* CRITICAL FOR MULTI-TOUCH/STYLUS: Prevents browser scrolling over canvas */
+        canvas{display:block;width:100%;height:100%; touch-action: none;}
+        
+        .tag{position:absolute;top:12px;left:12px;background:rgba(0,0,0,.8);padding:4px 10px;border-radius:6px;font:13px monospace;pointer-events:none;border:1px solid #30363d}
+        .info{position:absolute;bottom:12px;left:12px;font:12px monospace;color:#8b949e;pointer-events:none}
+        .hint{position:absolute;bottom:12px;right:12px;font:11px monospace;color:#6e7681;pointer-events:none}
+        #status{font-size:13px;color:#56d364;font-family:monospace;margin-left:auto}
+    </style>
+</head>
+<body>
+<div id="toolbar">
+    <label>f(z)</label>
+    <input id="fInput" value="z^2 - 1" style="width:160px">
+    <label>Depth (n)</label>
+    <input id="nInput" type="number" value="3" min="1" max="7" style="width:60px">
+    <button onclick="recompute()">Recompute</button>
+    <button onclick="clearPaths()" style="background:#21262d">Clear Loops</button>
+    <span id="status">Ready</span>
+</div>
+<div id="workspaces">
+    <div class="pane">
+        <canvas id="cZ"></canvas>
+        <div class="tag">Z-Plane (Universal Cover / Tree)</div>
+        <div class="hint">Hover: view node/paths · Shift+drag: pan · Pinch: zoom</div>
+    </div>
+    <div class="pane">
+        <canvas id="cW"></canvas>
+        <div class="tag">W-Plane (Base Space)</div>
+        <div class="hint">Hover: view paths · Draw: pen/mouse · Alt+click: basepoint</div>
+        <div class="info" id="wInfo"></div>
+    </div>
+</div>
+
+<script>
+// ========== STATE ==========
+let bp = {re:0, im:1.5};
+let tree = [];
+let pathData = []; // Array of { wPath: [], zBranches: [ [], []... ] }
+let curPath = [];
+let drawing = false;
+let crits = [];
+let pcs = [];
+let polyInfo = null;
+
+let hoveredNode = null; 
+let hoveredPathIdx = null;
+
+const vZ = {x:0, y:0, z:80};
+const vW = {x:0, y:0, z:80};
+
+const $cZ = document.getElementById('cZ');
+const $cW = document.getElementById('cW');
+const xZ = $cZ.getContext('2d');
+const xW = $cW.getContext('2d');
+
+// ========== DYNAMIC COLOR ASSIGNMENT ==========
+function getDynamicHue(index, total) {
+    if (total <= 1) return `hsl(0, 85%, 70%)`;
+    // Distribute hues cleanly around the color wheel based on the total node count
+    const hue = (index * 360) / total;
+    return `hsl(${hue}, 85%, 70%)`;
+}
+
+// ========== COMPLEX ARITHMETIC CORE ==========
+function cNum(re, im=0) { return {re, im}; }
+function cAdd(a,b) { return {re:a.re+b.re, im:a.im+b.im}; }
+function cSub(a,b) { return {re:a.re-b.re, im:a.im-b.im}; }
+function cMul(a,b) { return {re:a.re*b.re-a.im*b.im, im:a.re*b.im+a.im*b.re}; }
+function cDiv(a,b) {
+    const d = b.re*b.re+b.im*b.im;
+    if(d===0) return cNum(0,0);
+    return {re:(a.re*b.re+a.im*b.im)/d, im:(a.im*b.re-a.re*b.im)/d};
+}
+function cNeg(a) { return {re:-a.re, im:-a.im}; }
+function cAbs(a) { return Math.sqrt(a.re*a.re+a.im*a.im); }
+function cSqrt(a) {
+    const r = cAbs(a);
+    if(r===0) return cNum(0,0);
+    const t = Math.atan2(a.im, a.re)/2;
+    const sr = Math.sqrt(r);
+    return {re:sr*Math.cos(t), im:sr*Math.sin(t)};
+}
+
+function fwd(z) {
+    try {
+        const r = math.evaluate(document.getElementById('fInput').value, {z: math.complex(z.re, z.im)});
+        return typeof r==='number' ? cNum(r) : cNum(r.re, r.im);
+    } catch(e) { return null; }
+}
+
+// ========== NUMERICAL COEFFICIENT EXTRACTOR (FFT) ==========
+function getCoeffs() {
+    const M = 16; 
+    let coeffs = [];
+    for(let j=0; j<M; j++) {
+        let sum = cNum(0,0);
+        for(let k=0; k<M; k++) {
+            const z_ang = 2 * Math.PI * k / M;
+            const zk = cNum(Math.cos(z_ang), Math.sin(z_ang));
+            const fzk = fwd(zk);
+            if(!fzk) return null;
+            
+            const exp_ang = -2 * Math.PI * j * k / M;
+            const w_jk = cNum(Math.cos(exp_ang), Math.sin(exp_ang));
+            sum = cAdd(sum, cMul(fzk, w_jk));
+        }
+        let cj = cDiv(sum, cNum(M));
+        if(Math.abs(cj.re) < 1e-6) cj.re = 0;
+        if(Math.abs(cj.im) < 1e-6) cj.im = 0;
+        coeffs.push(cj);
+    }
+    let deg = M - 1;
+    while(deg > 0 && cAbs(coeffs[deg]) < 1e-6) { deg--; }
+    if(deg === 0) return null;
+    const finalCoeffs = [];
+    for(let i=deg; i>=0; i--) finalCoeffs.push(coeffs[i]);
+    return { deg: deg, coeffs: finalCoeffs };
+}
+
+// ========== ROBUST ROOT FINDERS ==========
+function polyRoots(coeffs) {
+    const n = coeffs.length - 1;
+    if (n <= 0) return [];
+    const lc = coeffs[0];
+    const c = coeffs.map(v => cDiv(v, lc));
+    if (n === 1) return [cNeg(c[1])];
+    if (n === 2) {
+        const disc = cSub(cMul(c[1],c[1]), cMul(cNum(4), c[2]));
+        const sd = cSqrt(disc);
+        const r1 = cDiv(cSub(cNeg(c[1]), sd), cNum(2));
+        const r2 = cDiv(cAdd(cNeg(c[1]), sd), cNum(2));
+        return [r1, r2];
+    }
+    return aberthEhrlich(c);
+}
+
+function evalPoly(coeffs, z) {
+    let val = cNum(0);
+    for(let i=0; i<coeffs.length; i++) val = cAdd(cMul(val, z), coeffs[i]);
+    return val;
+}
+function evalPolyDeriv(coeffs, z) {
+    const n = coeffs.length - 1;
+    let val = cNum(0);
+    for(let i=0; i<n; i++) val = cAdd(cMul(val, z), cMul(coeffs[i], cNum(n-i)));
+    return val;
+}
+
+function aberthEhrlich(coeffs) {
+    const n = coeffs.length - 1;
+    let R = 0;
+    for(let i=1; i<=n; i++) R = Math.max(R, cAbs(coeffs[i]));
+    R = 1 + R;
+    const roots = [];
+    for(let k=0; k<n; k++) {
+        const ang = 2*Math.PI*k/n + 0.37;
+        roots.push(cNum(R*0.8*Math.cos(ang), R*0.8*Math.sin(ang)));
+    }
+    for(let iter=0; iter<300; iter++) {
+        let maxShift = 0;
+        for(let i=0; i<n; i++) {
+            const pz = evalPoly(coeffs, roots[i]);
+            const dpz = evalPolyDeriv(coeffs, roots[i]);
+            const newton = cDiv(pz, dpz);
+            let s = cNum(0);
+            for(let j=0; j<n; j++) {
+                if(j===i) continue;
+                const diff = cSub(roots[i], roots[j]);
+                if(cAbs(diff) > 1e-15) s = cAdd(s, cDiv(cNum(1), diff));
+            }
+            const denom = cSub(cNum(1), cMul(newton, s));
+            const delta = cAbs(denom) < 1e-20 ? newton : cDiv(newton, denom);
+            roots[i] = cSub(roots[i], delta);
+            maxShift = Math.max(maxShift, cAbs(delta));
+        }
+        if(maxShift < 1e-12) break;
+    }
+    return roots;
+}
+
+// ========== IMG WREATH PREIMAGES ==========
+function preimages(w) {
+    if(!polyInfo) return [];
+    const c = polyInfo.coeffs.map((v,i) => i === polyInfo.deg ? cSub(v, w) : {...v});
+    const roots = polyRoots(c);
+    roots.sort((a,b) => Math.atan2(a.im,a.re) - Math.atan2(b.im,b.re));
+    return roots;
+}
+
+function computePCS() {
+    crits = []; pcs = [];
+    if(!polyInfo) return;
+    const d = polyInfo.deg;
+    const dfCoeffs = [];
+    for(let i=0; i<d; i++) dfCoeffs.push(cMul(polyInfo.coeffs[i], cNum(d-i)));
+    polyRoots(dfCoeffs).forEach(c => {
+        if(isFinite(c.re) && isFinite(c.im)) crits.push(c);
+    });
+    const seen = new Set();
+    crits.forEach(cp => {
+        let cur = cp;
+        for(let i=0; i<30; i++) {
+            const nxt = fwd(cur);
+            if(!nxt || !isFinite(nxt.re) || Math.abs(nxt.re)>1e5) break;
+            const key = nxt.re.toFixed(4)+','+nxt.im.toFixed(4);
+            if(seen.has(key)) break;
+            seen.add(key);
+            pcs.push(nxt);
+            cur = nxt;
+        }
+    });
+    document.getElementById('wInfo').innerHTML = `<span style="color:#ff7b72">Crits: ${crits.length}</span> · <span style="color:#d2a8ff">Orbit: ${pcs.length}</span>`;
+}
+
+function getAddress(layerIdx, nodeIdx, degree) {
+    if (layerIdx === 0) return "root";
+    let addr = "";
+    let curr = nodeIdx;
+    for (let i = 0; i < layerIdx; i++) {
+        addr = (curr % degree).toString() + addr;
+        curr = Math.floor(curr / degree);
+    }
+    return addr;
+}
+
+function buildTree() {
+    if(!polyInfo) { tree=[]; render(); return; }
+    const n = parseInt(document.getElementById('nInput').value);
+    const d = polyInfo.deg;
+    tree = [[bp]];
+    for(let i=0; i<n; i++) {
+        const cur = tree[i];
+        const nxt = [];
+        cur.forEach(pt => {
+            if(!pt) { for(let k=0;k<d;k++) nxt.push(null); return; }
+            const pre = preimages(pt);
+            for(let k=0;k<d;k++) nxt.push(pre[k]||null);
+        });
+        tree.push(nxt);
+    }
+    render();
+}
+
+function liftPath(pw) {
+    if(!pw.length || !polyInfo) return [];
+    const n = parseInt(document.getElementById('nInput').value);
+    const branches = [];
+    pw.forEach((wPt, step) => {
+        let set = [wPt];
+        for(let i=0; i<n; i++) {
+            const nxt = [];
+            set.forEach(p => {
+                if(!p) return;
+                preimages(p).forEach(r => nxt.push(r));
+            });
+            set = nxt;
+        }
+        if(step === 0) {
+            set.forEach(pt => branches.push([pt]));
+        } else {
+            const used = new Set();
+            branches.forEach(br => {
+                const last = br[br.length-1];
+                if(!last) { br.push(null); return; }
+                let best=-1, bestD=Infinity;
+                set.forEach((pt,idx) => {
+                    if(!pt || used.has(idx)) return;
+                    const d = (pt.re-last.re)**2 + (pt.im-last.im)**2;
+                    if(d<bestD) { bestD=d; best=idx; }
+                });
+                if(best>=0) { br.push(set[best]); used.add(best); }
+                else br.push(null);
+            });
+        }
+    });
+    return branches;
+}
+
+function updatePathLifts() {
+    pathData.forEach(p => { p.zBranches = liftPath(p.wPath); });
+}
+
+// ========== GEOMETRY / HIT TESTING ==========
+function distSq(p, v, w) {
+    let l2 = (v.re - w.re)**2 + (v.im - w.im)**2;
+    if (l2 === 0) return (p.re - v.re)**2 + (p.im - v.im)**2;
+    let t = ((p.re - v.re)*(w.re - v.re) + (p.im - v.im)*(w.im - v.im)) / l2;
+    t = Math.max(0, Math.min(1, t));
+    return (p.re - (v.re + t*(w.re - v.re)))**2 + (p.im - (v.im + t*(w.im - v.im)))**2;
+}
+
+function hitTestPath(mouseC, path, thresholdSq) {
+    for (let i = 0; i < path.length - 1; i++) {
+        if (!path[i] || !path[i+1]) continue;
+        if (distSq(mouseC, path[i], path[i+1]) < thresholdSq) return true;
+    }
+    return false;
+}
+
+// ========== RENDER ENGINE ==========
+function s2c(c,v,cv) { return {x:cv.width/2+(c.re-v.x)*v.z, y:cv.height/2-(c.im-v.y)*v.z}; }
+function c2s(sx,sy,v,cv) { return {re:v.x+(sx-cv.width/2)/v.z, im:v.y-(sy-cv.height/2)/v.z}; }
+
+function grid(ctx,v,cv) {
+    ctx.clearRect(0,0,cv.width,cv.height);
+    const o = s2c(cNum(0,0),v,cv);
+    ctx.strokeStyle='#1a212d'; ctx.lineWidth=1;
+    const tl=c2s(0,0,v,cv), br=c2s(cv.width,cv.height,v,cv);
+    const x0=Math.floor(Math.min(tl.re,br.re)), x1=Math.ceil(Math.max(tl.re,br.re));
+    const y0=Math.floor(Math.min(tl.im,br.im)), y1=Math.ceil(Math.max(tl.im,br.im));
+    ctx.beginPath();
+    for(let i=x0;i<=x1;i++){const p=s2c({re:i,im:0},v,cv);ctx.moveTo(p.x,0);ctx.lineTo(p.x,cv.height);}
+    for(let i=y0;i<=y1;i++){const p=s2c({re:0,im:i},v,cv);ctx.moveTo(0,p.y);ctx.lineTo(cv.width,p.y);}
+    ctx.stroke();
+    ctx.strokeStyle='#30363d';ctx.lineWidth=1.5;ctx.beginPath();
+    ctx.moveTo(0,o.y);ctx.lineTo(cv.width,o.y);ctx.moveTo(o.x,0);ctx.lineTo(o.x,cv.height);ctx.stroke();
+}
+
+function dot(ctx,cv,v,pt,col,r=4,fill=true,dash=false) {
+    if(!pt) return;
+    const p=s2c(pt,v,cv);
+    ctx.save(); if(dash) ctx.setLineDash([2,2]);
+    ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2);
+    if(fill){ctx.fillStyle=col;ctx.fill();}
+    ctx.strokeStyle=fill ? '#000': col; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.restore();
+}
+
+function lbl(ctx,cv,v,pt,txt,col='#fff') {
+    if(!pt) return;
+    const p=s2c(pt,v,cv);
+    ctx.font='10px monospace'; ctx.fillStyle=col; ctx.fillText(txt,p.x+8,p.y-6);
+}
+
+function tooltip(ctx,cv,v,pt,txt, borderCol='#58a6ff') {
+    if(!pt) return;
+    const p = s2c(pt,v,cv);
+    ctx.font = '13px monospace'; const m = ctx.measureText(txt);
+    const boxW = m.width + 16, boxH = 22;
+    ctx.save();
+    ctx.fillStyle = 'rgba(13, 17, 23, 0.9)'; ctx.strokeStyle = borderCol; ctx.lineWidth = 1;
+    ctx.fillRect(p.x + 12, p.y - boxH/2, boxW, boxH); ctx.strokeRect(p.x + 12, p.y - boxH/2, boxW, boxH);
+    ctx.fillStyle = borderCol; ctx.fillText(txt, p.x + 20, p.y + 4);
+    ctx.restore();
+}
+
+function pathLine(ctx,cv,v,pts,col,w=2, a=1) {
+    const ok=pts.filter(p=>p&&isFinite(p.re));
+    if(ok.length<2) return;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.beginPath(); ctx.strokeStyle=col; ctx.lineWidth=w;
+    const p0=s2c(ok[0],v,cv); ctx.moveTo(p0.x,p0.y);
+    for(let i=1;i<ok.length;i++){const px=s2c(ok[i],v,cv);ctx.lineTo(px.x,px.y);}
+    ctx.stroke();
+    ctx.restore();
+}
+
+function render() {
+    $cZ.width=$cZ.clientWidth; $cZ.height=$cZ.clientHeight;
+    $cW.width=$cW.clientWidth; $cW.height=$cW.clientHeight;
+
+    // ----- W-PLANE -----
+    grid(xW,vW,$cW);
+    pcs.forEach((pt,i) => dot(xW,$cW,vW,pt,'#d2a8ff',4,false,true));
+    crits.forEach((pt,i) => { dot(xW,$cW,vW,pt,'#ff7b72',5,true); lbl(xW,$cW,vW,pt,`c${i}`,'#ff7b72'); });
+    dot(xW,$cW,vW,bp,'#e2e8f0',6,true); lbl(xW,$cW,vW,bp,`z₀`,'#e2e8f0');
+    
+    // Draw W Paths
+    pathData.forEach((pd, i) => {
+        const isHov = hoveredPathIdx === i;
+        const isFade = hoveredPathIdx !== null && !isHov;
+        // Provide visual feedback base space paths
+        pathLine(xW,$cW,vW,pd.wPath,'#fbbf24', isHov?4:2.5, isFade?0.2:1);
+    });
+    if(curPath.length) pathLine(xW,$cW,vW,curPath,'#fbbf24',2.5);
+
+    // ----- Z-PLANE -----
+    grid(xZ,vZ,$cZ);
+    const d = polyInfo ? polyInfo.deg : 2;
+    
+    if(tree.length>0) {
+        // Draw Tree Edges
+        for(let l=1;l<tree.length;l++) {
+            tree[l].forEach((pt,i) => {
+                if(!pt) return;
+                const par = tree[l-1][Math.floor(i/d)];
+                if(par) pathLine(xZ,$cZ,vZ,[par,pt],'rgba(255,255,255,0.1)',1);
+            });
+        }
+    }
+
+    // Draw Z Cached Branches (Lifted paths)
+    pathData.forEach((pd, i) => {
+        const isHov = hoveredPathIdx === i;
+        const isFade = hoveredPathIdx !== null && !isHov;
+        const total = pd.zBranches.length;
+        pd.zBranches.forEach((br, bIdx) => {
+            const col = getDynamicHue(bIdx, total);
+            pathLine(xZ,$cZ,vZ,br.filter(Boolean), col, isHov?3.5:2.5, isFade?0.2:1);
+        });
+    });
+
+    // Draw Currently Drawing Lifted Paths
+    if(curPath.length) {
+        const lifts = liftPath(curPath);
+        const total = lifts.length;
+        lifts.forEach((br, bIdx) => {
+            const col = getDynamicHue(bIdx, total);
+            pathLine(xZ,$cZ,vZ,br.filter(Boolean), col, 2.5, 1);
+        });
+    }
+
+    // Draw Tree Vertices on top to cleanly layer them over origin lines
+    if(tree.length>0) {
+        tree.forEach((layer,l) => {
+            const isLeaf = l === (tree.length-1);
+            const total = layer.length;
+            layer.forEach((pt,i) => {
+                const col = isLeaf ? getDynamicHue(i, total) : '#8b949e';
+                dot(xZ,$cZ,vZ,pt, col, isLeaf?5:3, true);
+            });
+        });
+    }
+
+    // Highlight Tooltip UI
+    if(hoveredNode) {
+        const isLeaf = hoveredNode.layer === (tree.length-1);
+        const totalNodes = tree[hoveredNode.layer].length;
+        const nodeCol = isLeaf ? getDynamicHue(hoveredNode.index, totalNodes) : '#58a6ff';
+        
+        dot(xZ,$cZ,vZ,hoveredNode.pt, nodeCol, 8, false); // Draw hollow ring around specific node
+        tooltip(xZ,$cZ,vZ,hoveredNode.pt, hoveredNode.address, nodeCol);
+    }
+}
+
+// ========== POINTER/MULTI-TOUCH ENGINE ==========
+function clearPaths() { pathData=[]; curPath=[]; hoveredPathIdx = null; render(); }
+
+const ptrsZ = new Map();
+let pinchZ = null;
+const ptrsW = new Map();
+let pinchW = null;
+
+function initPinch(cv, view, ptrs) {
+    const p = Array.from(ptrs.values()), r = cv.getBoundingClientRect();
+    const x1 = p[0].clientX - r.left, y1 = p[0].clientY - r.top;
+    const x2 = p[1].clientX - r.left, y2 = p[1].clientY - r.top;
+    return { dist: Math.hypot(x2-x1, y2-y1), cMid: c2s((x1+x2)/2, (y1+y2)/2, view, cv), vZ: view.z };
+}
+
+function applyPinch(cv, view, ptrs, state) {
+    if(!state || state.dist < 5) return;
+    const p = Array.from(ptrs.values()), r = cv.getBoundingClientRect();
+    const x1 = p[0].clientX - r.left, y1 = p[0].clientY - r.top;
+    const x2 = p[1].clientX - r.left, y2 = p[1].clientY - r.top;
+    const mx = (x1+x2)/2, my = (y1+y2)/2;
+    view.z = Math.max(5, state.vZ * (Math.hypot(x2-x1, y2-y1) / state.dist));
+    view.x = state.cMid.re - (mx - cv.width/2)/view.z;
+    view.y = state.cMid.im + (my - cv.height/2)/view.z;
+}
+
+// ---- Z Plane Pointer Logic ----
+$cZ.addEventListener('pointerdown', e => {
+    $cZ.setPointerCapture(e.pointerId);
+    ptrsZ.set(e.pointerId, e);
+    if(ptrsZ.size === 2) pinchZ = initPinch($cZ, vZ, ptrsZ);
+});
+
+$cZ.addEventListener('pointermove', e => {
+    if(ptrsZ.has(e.pointerId)) ptrsZ.set(e.pointerId, e);
+    
+    if(ptrsZ.size === 2) {
+        applyPinch($cZ, vZ, ptrsZ, pinchZ);
+        hoveredNode = null; hoveredPathIdx = null; render(); return;
+    }
+    
+    if(e.shiftKey && e.buttons === 1) { 
+        vZ.x-=e.movementX/vZ.z; vZ.y+=e.movementY/vZ.z; 
+        hoveredNode = null; hoveredPathIdx = null; render(); return; 
+    }
+    
+    if(ptrsZ.size <= 1) {
+        const rect = $cZ.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        const mouseC = c2s(mx, my, vZ, $cZ);
+        
+        let hNode = null, bestDist = 14; 
+        const d = polyInfo ? polyInfo.deg : 2;
+        
+        for(let l=0; l<tree.length; l++) {
+            for(let i=0; i<tree[l].length; i++) {
+                if(!tree[l][i]) continue;
+                const MathDist = Math.hypot(s2c(tree[l][i], vZ, $cZ).x - mx, s2c(tree[l][i], vZ, $cZ).y - my);
+                if(MathDist < bestDist) {
+                    bestDist = MathDist;
+                    hNode = { pt: tree[l][i], layer: l, index: i, address: getAddress(l, i, d) };
+                }
+            }
+        }
+
+        let hPath = null;
+        if (!hNode) { // Only check paths if no node is hovered
+            const threshSq = (8 / vZ.z)**2; // 8 pixels in complex plane scale
+            for(let p=0; p<pathData.length; p++) {
+                let hitLocal = false;
+                for(let br of pathData[p].zBranches) {
+                    if(hitTestPath(mouseC, br, threshSq)) { hitLocal = true; break; }
+                }
+                if(hitLocal) { hPath = p; break; }
+            }
+        }
+
+        let changed = false;
+        if( (hNode && !hoveredNode) || (!hNode && hoveredNode) || 
+            (hNode && hoveredNode && (hNode.layer !== hoveredNode.layer || hNode.index !== hoveredNode.index))) {
+            hoveredNode = hNode; changed = true;
+        }
+        if (hoveredPathIdx !== hPath) {
+            hoveredPathIdx = hPath; changed = true;
+        }
+        
+        if(changed) {
+            $cZ.style.cursor = (hoveredNode || hoveredPathIdx !== null) ? 'pointer' : 'crosshair';
+            render();
+        }
+    }
+});
+
+const removeZ = e => { ptrsZ.delete(e.pointerId); if(ptrsZ.size < 2) pinchZ = null; };
+$cZ.addEventListener('pointerup', removeZ);
+$cZ.addEventListener('pointercancel', removeZ);
+$cZ.addEventListener('pointerleave', e => { 
+    removeZ(e); 
+    if(hoveredNode || hoveredPathIdx !== null){ hoveredNode=null; hoveredPathIdx = null; render();} 
+});
+
+
+// ---- W Plane Pointer Logic ----
+$cW.addEventListener('pointerdown', e => {
+    $cW.setPointerCapture(e.pointerId);
+    ptrsW.set(e.pointerId, e);
+    
+    if(ptrsW.size === 2) {
+        drawing = false; curPath = []; 
+        pinchW = initPinch($cW, vW, ptrsW);
+    } else if(ptrsW.size === 1) {
+        const r = $cW.getBoundingClientRect();
+        const mx = e.clientX - r.left, my = e.clientY - r.top;
+        if(e.altKey || e.metaKey) { bp=c2s(mx,my,vW,$cW); buildTree(); updatePathLifts(); return; }
+        if(!e.shiftKey && e.button === 0 && e.pointerType !== 'touch') { 
+            drawing = true; curPath=[c2s(mx,my,vW,$cW)]; 
+            hoveredPathIdx = null; 
+        } else if(e.pointerType === 'touch') {
+            drawing = true; curPath=[c2s(mx,my,vW,$cW)]; 
+            hoveredPathIdx = null;
+        }
+    }
+});
+
+$cW.addEventListener('pointermove', e => {
+    if(ptrsW.has(e.pointerId)) ptrsW.set(e.pointerId, e);
+    const r = $cW.getBoundingClientRect();
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    
+    if(ptrsW.size === 2) {
+        applyPinch($cW, vW, ptrsW, pinchW);
+        hoveredPathIdx = null; render(); return;
+    }
+    
+    if(drawing) {
+        curPath.push(c2s(mx, my, vW, $cW)); 
+        render(); 
+    } else if(e.shiftKey && e.buttons === 1) { 
+        vW.x-=e.movementX/vW.z; vW.y+=e.movementY/vW.z; 
+        render(); 
+    } else if(ptrsW.size <= 1) {
+        const mouseC = c2s(mx, my, vW, $cW);
+        const threshSq = (8 / vW.z)**2;
+        let hPath = null;
+        for(let p=0; p<pathData.length; p++) {
+            if(hitTestPath(mouseC, pathData[p].wPath, threshSq)) { hPath = p; break; }
+        }
+        if(hoveredPathIdx !== hPath) {
+            hoveredPathIdx = hPath;
+            $cW.style.cursor = hPath !== null ? 'pointer' : 'crosshair';
+            render();
+        }
+    }
+});
+
+const removeW = e => { 
+    if(drawing && curPath.length > 2 && ptrsW.size === 1) { 
+        pathData.push({ wPath: curPath, zBranches: liftPath(curPath) }); 
+    }
+    curPath=[]; drawing=false; 
+    ptrsW.delete(e.pointerId); 
+    if(ptrsW.size < 2) pinchW = null; 
+    render();
+};
+$cW.addEventListener('pointerup', removeW);
+$cW.addEventListener('pointercancel', removeW);
+$cW.addEventListener('pointerleave', e => { 
+    if(drawing && curPath.length > 2 && ptrsW.size === 1) { 
+        pathData.push({ wPath: curPath, zBranches: liftPath(curPath) }); 
+    }
+    curPath=[]; drawing=false; 
+    ptrsW.delete(e.pointerId); 
+    if(ptrsW.size < 2) pinchW = null; 
+    
+    if(hoveredPathIdx !== null) { hoveredPathIdx = null; render(); }
+});
+
+// Zoom logic
+function wheelZoom(e, cv, view) {
+    e.preventDefault();
+    const r = cv.getBoundingClientRect();
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    const cOld = c2s(mx, my, view, cv);
+    view.z = Math.max(5, view.z * Math.exp(-e.deltaY * 0.001)); 
+    view.x = cOld.re - (mx - cv.width/2)/view.z;
+    view.y = cOld.im + (my - cv.height/2)/view.z;
+    render();
+}
+
+$cW.addEventListener('wheel', e => wheelZoom(e, $cW, vW), {passive:false});
+$cZ.addEventListener('wheel', e => wheelZoom(e, $cZ, vZ), {passive:false});
+
+document.addEventListener('contextmenu', e=>e.preventDefault());
+let tmr=null;
+document.getElementById('fInput').addEventListener('input', () => { clearTimeout(tmr); tmr=setTimeout(recompute,500); });
+document.getElementById('nInput').addEventListener('change', () => { if(polyInfo) { buildTree(); updatePathLifts(); render(); }});
+
+function recompute() {
+    polyInfo = getCoeffs();
+    const stat = document.getElementById('status');
+    if(polyInfo) {
+        stat.textContent = `Degree ${polyInfo.deg} Polynomial Form detected`;
+        stat.style.color = '#56d364';
+        computePCS();
+        buildTree();
+        updatePathLifts();
+    } else {
+        stat.textContent = 'Invalid expression. Try z^2-1';
+        stat.style.color = '#f85149';
+    }
+    hoveredNode = null; 
+    hoveredPathIdx = null;
+    render();
+}
+
+window.addEventListener('resize', render);
+recompute();
+</script>
+</body>
+</html>
