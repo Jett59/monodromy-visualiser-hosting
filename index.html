@@ -25,22 +25,44 @@
         .info{position:absolute;bottom:12px;left:12px;font:12px monospace;color:#8b949e;pointer-events:none}
         .hint{position:absolute;bottom:12px;right:12px;font:11px monospace;color:#6e7681;pointer-events:none}
         #status{font-size:13px;color:#56d364;font-family:monospace;margin-left:auto}
+
+        .preset{background:#1f6feb;padding:5px 10px}
+        .preset:hover{background:#388bfd}
+        .divider{height:24px;border-left:1px solid #30363d;margin:0 2px}
+        .legend{position:absolute;top:48px;left:12px;background:rgba(0,0,0,.72);padding:8px 10px;border-radius:6px;font:12px monospace;pointer-events:none;border:1px solid #30363d;color:#c9d1d9;line-height:1.55}
+        .legend .muted{color:#8b949e}
+        .legend .leaf{color:#79c0ff}
+        .legend .path{color:#fbbf24}
     </style>
 </head>
 <body>
 <div id="toolbar">
     <label>f(z)</label>
-    <input id="fInput" value="z^2 - 1" style="width:160px">
+    <input id="fInput" value="z^2 - 1" style="width:170px">
     <label>Depth (n)</label>
-    <input id="nInput" type="number" value="3" min="1" max="7" style="width:60px">
+    <input id="nInput" type="number" value="3" min="1" max="6" style="width:60px">
     <button onclick="recompute()">Recompute</button>
     <button onclick="clearPaths()" style="background:#21262d">Clear Loops</button>
+    <button onclick="resetView()" style="background:#21262d">Reset View</button>
+
+    <span class="divider"></span>
+    <label>Presets</label>
+    <button class="preset" onclick="setFunction('z^2')">z²</button>
+    <button class="preset" onclick="setFunction('z^2 - 1')">z² − 1</button>
+    <button class="preset" onclick="setFunction('z^2 + i')">z² + i</button>
+    <button class="preset" onclick="setFunction('z^2 + (-0.123 + 0.745i)')">Rabbit</button>
+
     <span id="status">Ready</span>
 </div>
 <div id="workspaces">
     <div class="pane">
         <canvas id="cZ"></canvas>
         <div class="tag">Z-Plane (Universal Cover / Tree)</div>
+        <div class="legend">
+            <div><span class="leaf">coloured points</span> = final preimages</div>
+            <div><span class="muted">grey points</span> = earlier levels</div>
+            <div><span class="path">coloured lines</span> = lifted paths</div>
+        </div>
         <div class="hint">Hover: view node/paths · Shift+drag: pan · Pinch: zoom</div>
     </div>
     <div class="pane">
@@ -245,7 +267,7 @@ function getAddress(layerIdx, nodeIdx, degree) {
 
 function buildTree() {
     if(!polyInfo) { tree=[]; render(); return; }
-    const n = parseInt(document.getElementById('nInput').value);
+    const n = Math.min(6, parseInt(document.getElementById('nInput').value));
     const d = polyInfo.deg;
     tree = [[bp]];
     for(let i=0; i<n; i++) {
@@ -263,7 +285,7 @@ function buildTree() {
 
 function liftPath(pw) {
     if(!pw.length || !polyInfo) return [];
-    const n = parseInt(document.getElementById('nInput').value);
+    const n = Math.min(6, parseInt(document.getElementById('nInput').value));
     const branches = [];
     pw.forEach((wPt, step) => {
         let set = [wPt];
@@ -336,13 +358,13 @@ function grid(ctx,v,cv) {
     ctx.moveTo(0,o.y);ctx.lineTo(cv.width,o.y);ctx.moveTo(o.x,0);ctx.lineTo(o.x,cv.height);ctx.stroke();
 }
 
-function dot(ctx,cv,v,pt,col,r=4,fill=true,dash=false) {
+function dot(ctx,cv,v,pt,col,r=4,fill=true,dash=false,strokeW=1.5) {
     if(!pt) return;
     const p=s2c(pt,v,cv);
     ctx.save(); if(dash) ctx.setLineDash([2,2]);
     ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2);
     if(fill){ctx.fillStyle=col;ctx.fill();}
-    ctx.strokeStyle=fill ? '#000': col; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.strokeStyle=fill ? '#000': col; ctx.lineWidth=strokeW; ctx.stroke();
     ctx.restore();
 }
 
@@ -405,7 +427,7 @@ function render() {
             tree[l].forEach((pt,i) => {
                 if(!pt) return;
                 const par = tree[l-1][Math.floor(i/d)];
-                if(par) pathLine(xZ,$cZ,vZ,[par,pt],'rgba(255,255,255,0.1)',1);
+                if(par) pathLine(xZ,$cZ,vZ,[par,pt],'rgba(255,255,255,0.1)',0.6);
             });
         }
     }
@@ -417,7 +439,7 @@ function render() {
         const total = pd.zBranches.length;
         pd.zBranches.forEach((br, bIdx) => {
             const col = getDynamicHue(bIdx, total);
-            pathLine(xZ,$cZ,vZ,br.filter(Boolean), col, isHov?3.5:2.5, isFade?0.2:1);
+            pathLine(xZ,$cZ,vZ,br.filter(Boolean), col, isHov?2.4:1.6, isFade?0.2:0.9);
         });
     });
 
@@ -427,7 +449,7 @@ function render() {
         const total = lifts.length;
         lifts.forEach((br, bIdx) => {
             const col = getDynamicHue(bIdx, total);
-            pathLine(xZ,$cZ,vZ,br.filter(Boolean), col, 2.5, 1);
+            pathLine(xZ,$cZ,vZ,br.filter(Boolean), col, 1.6, 0.9);
         });
     }
 
@@ -438,7 +460,8 @@ function render() {
             const total = layer.length;
             layer.forEach((pt,i) => {
                 const col = isLeaf ? getDynamicHue(i, total) : '#8b949e';
-                dot(xZ,$cZ,vZ,pt, col, isLeaf?5:3, true);
+                // Thinner/smaller points on the left Z-plane
+                dot(xZ,$cZ,vZ,pt, col, isLeaf?3.2:2.1, true, false, 0.75);
             });
         });
     }
@@ -449,13 +472,28 @@ function render() {
         const totalNodes = tree[hoveredNode.layer].length;
         const nodeCol = isLeaf ? getDynamicHue(hoveredNode.index, totalNodes) : '#58a6ff';
         
-        dot(xZ,$cZ,vZ,hoveredNode.pt, nodeCol, 8, false); // Draw hollow ring around specific node
+        dot(xZ,$cZ,vZ,hoveredNode.pt, nodeCol, 5.2, false, false, 0.9); // Draw thinner hollow ring around specific node
         tooltip(xZ,$cZ,vZ,hoveredNode.pt, hoveredNode.address, nodeCol);
     }
 }
 
 // ========== POINTER/MULTI-TOUCH ENGINE ==========
 function clearPaths() { pathData=[]; curPath=[]; hoveredPathIdx = null; render(); }
+
+function resetView() {
+    vZ.x = 0; vZ.y = 0; vZ.z = 80;
+    vW.x = 0; vW.y = 0; vW.z = 80;
+    hoveredNode = null;
+    hoveredPathIdx = null;
+    render();
+}
+
+function setFunction(expr) {
+    document.getElementById('fInput').value = expr;
+    clearPaths();
+    recompute();
+    resetView();
+}
 
 const ptrsZ = new Map();
 let pinchZ = null;
